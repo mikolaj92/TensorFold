@@ -97,6 +97,7 @@ class GlmEngine:
 
         from tensorfold.cuda.comm import NCCL
         from .decode import Engine
+        from .nonexpert import nonexpert_bytes
         from .weights import Config, load
         from .split import rule
         from tensorfold.cuda.capacity import admit
@@ -119,7 +120,7 @@ class GlmEngine:
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
                                                              latent=LATENT),
-                                   split_weights(rule), rank=rank, world=2, gather=self._gather_ints,
+                                   split_weights(rule, rewrite=nonexpert_bytes), rank=rank, world=2, gather=self._gather_ints,
                                    draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
                                    draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
         self.limit = self.capacity_plan["context_window"]

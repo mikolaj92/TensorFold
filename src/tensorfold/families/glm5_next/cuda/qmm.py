@@ -155,20 +155,52 @@ def make_b16(weight: torch.Tensor) -> B16:
     return B16(w, int(w.shape[0]), int(w.shape[1]))
 
 
-def quantize4(w: torch.Tensor, chunk: int = 8192) -> Q4:
-    """Quantize bf16 weights to tiled affine 4-bit groups of 64 for drafting only, never verification."""
+# q4mse shrinks each group's [min, max] about its centre. 1.0 is included, so the error is never worse than q4.
+_MSE_FACTORS = tuple(step / 100 for step in range(100, 75, -3))
+
+
+def _affine_groups(
+    g: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Affine 4-bit codes for groups ``g`` over ``[lo, hi]``, with the bf16 scale and bias the kernel stores."""
+
+    scale = ((hi - lo) / 15).clamp_min(1e-8).to(torch.bfloat16)
+    bias = lo.to(torch.bfloat16)
+    q = torch.round((g - bias.float()[..., None]) / scale.float()[..., None]).clamp(0, 15)
+    recon = q * scale.float()[..., None] + bias.float()[..., None]
+    return scale, bias, q, (recon - g).square().sum(-1)
+
+
+def quantize4(w: torch.Tensor, chunk: int = 8192, *, mse: bool = False) -> Q4:
+    """Quantize bf16 weights to tiled affine 4-bit groups of 64.
+
+    ``mse`` picks, per group, the shrink of ``[min, max]`` about its centre with the smallest reconstruction error
+    (``TF_GLM_NONEXPERT=q4mse``). The plain range is what a draft head uses.
+    """
 
     n, k = w.shape
+    if k % GS:
+        raise ValueError(f"4-bit groups of {GS} need K divisible by {GS}, got {k}")
     words = torch.empty((n, k // 8), dtype=torch.int32, device=w.device)
-    scales = torch.empty((n, k // 64), dtype=torch.bfloat16, device=w.device)
+    scales = torch.empty((n, k // GS), dtype=torch.bfloat16, device=w.device)
     biases = torch.empty_like(scales)
     for r in range(0, n, chunk):
-        g = w[r:r + chunk].float().view(-1, k // 64, 64)
+        g = w[r:r + chunk].float().view(-1, k // GS, GS)
         lo, hi = g.amin(-1), g.amax(-1)
-        scale = ((hi - lo) / 15).clamp_min(1e-8).to(torch.bfloat16)
-        bias = lo.to(torch.bfloat16)
-        q = torch.round((g - bias.float()[..., None]) / scale.float()[..., None]).clamp(0, 15).to(torch.int32)
-        q = q.view(-1, k // 8, 8)
+        if not mse:
+            scale, bias, q = _affine_groups(g, lo, hi)[:3]
+        else:
+            mid, half = (lo + hi) / 2, (hi - lo) / 2
+            scale, bias, q, best = _affine_groups(g, lo, hi)
+            for factor in _MSE_FACTORS[1:]:
+                span = half * factor
+                trial_s, trial_b, trial_q, err = _affine_groups(g, mid - span, mid + span)
+                take = err < best
+                best = torch.where(take, err, best)
+                scale = torch.where(take, trial_s, scale)
+                bias = torch.where(take, trial_b, bias)
+                q = torch.where(take[..., None], trial_q, q)
+        q = q.to(torch.int32).view(-1, k // 8, 8)
         part = torch.zeros(q.shape[:2], dtype=torch.int32, device=w.device)
         for j in range(8):
             part |= q[..., j] << (4 * j)

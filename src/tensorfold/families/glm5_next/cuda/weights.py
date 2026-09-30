@@ -13,7 +13,8 @@ from tensorfold.cuda import experts as grouped
 
 from .exl3_mm import Exl3Experts, words as exl3_words
 from . import latent
-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+from .nonexpert import nonexpert_mode
+from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_q4
 
 PREFIX = "model.language_model."
 
@@ -250,6 +251,10 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
+    mode = nonexpert_mode() if exl3 else "bf16"
+    if rank == 0 and mode != "bf16":
+        print(f"[tensorfold] EXL3 non-expert linears stored as {mode} (TF_GLM_NONEXPERT); "
+              "routed experts, norms and the latent absorb stay as loaded", flush=True)
     dev = torch.device(device)
     rd = RankReader(model_dir, rank)
     HL = cfg.heads // world
@@ -264,12 +269,19 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
+    def store(weight: torch.Tensor) -> Q4 | B16:
+        if not exl3:
+            raise ValueError("store() is the EXL3 non-expert path")
+        if mode == "bf16":
+            return make_b16(weight)
+        return quantize4(weight, mse=mode == "q4mse")
+
     def q4(name: str) -> Q4 | B16:
-        return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+        return store(t(name + ".weight")) if exl3 else make_q4(*trip(name))
 
     def stack(names: list[str]) -> Q4 | B16:
         if exl3:
-            return stack_b16([t(n + ".weight") for n in names])
+            return store(torch.cat([t(n + ".weight") for n in names]))
         return stack_q4([trip(n) for n in names])
 
     def hc(i: int, site: str) -> HCW:
@@ -412,9 +424,14 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
         vl = cfg.vocab // world
         draft_head = None
         if exl3:
-            head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
-            # Draft steps use the quantized head; verification keeps the original head.
-            draft_head = quantize4(head.weight)
+            head_rows = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
+            if mode == "bf16":
+                head = make_b16(head_rows)
+                # Draft steps use the quantized head; verification keeps the original head.
+                draft_head = quantize4(head.weight)
+            else:
+                head = quantize4(head_rows, mse=mode == "q4mse")
+                draft_head = None
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
