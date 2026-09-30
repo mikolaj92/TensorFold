@@ -97,7 +97,7 @@ def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
     return transform
 
 
-def split_weights(rule, world: int = 2):
+def split_weights(rule, world: int = 2, rewrite=None):
     def transform(name: str, info: dict) -> tuple[int, int]:
         kind = rule(name)
         if kind == "drop":
@@ -115,6 +115,8 @@ def split_weights(rule, world: int = 2):
         total = padded(info, shape, float32=cast, name=name)
         if name == "lm_head.weight" and info["dtype"] in ("BF16", "F16", "F32"):
             total += math.prod(shape) * 9 // 16  # the additional 4-bit draft head
+        if rewrite is not None:
+            return rewrite(name, info, shape, total, 0)
         return total, 0
     return transform
 

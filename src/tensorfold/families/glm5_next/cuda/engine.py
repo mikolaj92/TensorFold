@@ -117,6 +117,7 @@ class GlmEngine:
 
         from tensorfold.cuda.comm import NCCL
         from .decode import Engine
+        from .nonexpert import nonexpert_bytes
         from .weights import Config, load
         from .split import rule
         from tensorfold.cuda.capacity import admit
@@ -138,7 +139,7 @@ class GlmEngine:
 
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
-        weights_estimate = split_weights(rule)
+        weights_estimate = split_weights(rule, rewrite=nonexpert_bytes)
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
