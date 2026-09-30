@@ -111,9 +111,53 @@ Before calling this recipe qualified, run:
    prefill/decode, RAM, and selection vs sparse-attention profile.
 5. Idle both ranks, first request after idle, repeated decisions/chat wakeups,
    follower failure handling; record GPU and CPU usage, not just health.
-6. Qwen MLX regression on M4 Max for shared server/decisions changes; no DSA speedup claim.
 
 Rollback: stop both experimental ranks, restart the saved old rank 1 then rank 0
 using their unchanged source/image/options; verify health and a chat. No automatic
 upstream update. Publish new measured SHAs as new recipe revisions, not as an
 unexplained moving production branch.
+
+## Full-model integration run (2026-09-30)
+
+Source `51650c8`, two actual GB10 hosts, EXL3/DFlash2 revisions above,
+context 8192, ring on, image ID
+`sha256:ab68ecbfcb2bc1ace4845bc1c8e768a36bdb15b94f8f0db920b61563af4d6685`.
+This is the existing locally built image with the recipe source overriding
+Python imports, not a published clean image. Startup 145.9 seconds, including
+extension compilation; rank-0 estimate 91.19 GiB within 101.35 GiB.
+
+Integrated CUDA kernel, latent, ring and visible-pool suites: **68 passed**.
+Full-model decisions: 7/7 simple known-answer cases, probability invariants,
+tiny temperature, invalid kwargs and identical greedy chat before/after passed.
+After 65 seconds idle, rank1 GPU utilization was 0%; chat/decision sequence
+completed again. This does not yet establish arbitrary multi-turn cache parity.
+
+### Concurrent HTTP requests, not concurrent model decoding
+
+Short distinct prompts, greedy, thinking off, ignore_eos, 128 output tokens
+each, streamed, two waves per cell, warmed model, LAN client. Table is the
+mean of each wave's aggregate output tokens / full wave wall time, **including
+prefill and queueing**, not engine decode-only speed.
+
+| Simultaneous requests | draft=false aggregate tok/s | draft=true aggregate tok/s |
+|---:|---:|---:|
+| 1 | 10.49 | 22.38 |
+| 2 | 10.63 | 22.21 |
+| 4 | 10.53 | 22.35 |
+| 8 | 10.57 | 22.32 |
+
+The GLM engine serializes requests: raising concurrency does not raise aggregate
+throughput. At 8 requests the wave took about 97 s without drafts and 46 s with
+drafts; last first-token waits were about 85 s and 40 s respectively. Once a
+request starts, TTFT was typically 0.23–0.28 s. These are small-sample observed
+values, not robust percentiles or long-context capacity claims.
+
+Greedy response text matched draft=false vs draft=true for all 15 distinct
+prompts across the concurrency levels. However /health still reported
+drafted_total=accepted_total=0 despite fewer rounds and faster draft=true
+execution. Do not infer acceptance rate from these counters; telemetry requires
+further tracing, and explicit draft-policy qualification remains open.
+
+Long ~200k-context testing and the full GPU engine suite remain pending. The
+experimental containers were stopped and the unchanged production containers
+restarted after this run. M4 Max is not part of this TP2 recipe.
