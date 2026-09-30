@@ -498,6 +498,7 @@ class GlmEngine:
             raise ValueError("empty labels")
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
+        self._ring()                               # score requests wake the follower too
         self._share([0, len(labels)])               # max_tokens on a chat header is at least 1, so 0 is a score
         self._share(prompt)
         self._share(labels)
