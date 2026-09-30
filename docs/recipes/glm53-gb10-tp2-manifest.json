@@ -1,0 +1,14 @@
+{
+  "base": "9cd52ab4daba68ddd09be89be8f23ad43175e821",
+  "repository": "https://github.com/ashhart/TensorFold",
+  "pr_heads": {
+    "128": "fb5887d58c6c8518d0296b61a05205416b501d03",
+    "129": "75dc69f992aa4912661c159379a9e5517cca5f47",
+    "132": "eec0205d657c763c59d570ae7fecedf3dc926267",
+    "134": "5e90dc01dd4c55b5792fe162aba44a583d46c2c8",
+    "127": "39de4c9ee030aafbc47be9776c582c32703a8318",
+    "140": "602ed98d1cfebfde235086d2bcb4a5827987d920"
+  },
+  "qualification": "experimental; integrated GPU/full-model tests pending",
+  "local_uncommitted_patches_included": false
+}
