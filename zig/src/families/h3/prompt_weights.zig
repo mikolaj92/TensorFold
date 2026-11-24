@@ -260,7 +260,9 @@ pub fn loadRefiner(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: 
     return r;
 }
 
-/// The video checkpoint's spelling of an image checkpoint's refiner-block tensor name.
+/// The video checkpoint's spelling of an image checkpoint's refiner-block tensor name. Both checkpoints
+/// store the SwiGLU's fused input projection as [value; gate] rows (diffusers' PackedColwiseParallel([1, 1])
+/// documents the video one), so the mlp.fc1 mapping needs no row swap.
 fn videoBlockName(image_name: []const u8) []const u8 {
     const pairs = .{
         .{ "attn.q_norm.weight", "attn.norm_q.weight" },
