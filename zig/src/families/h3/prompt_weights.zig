@@ -47,9 +47,17 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const path = try std.fs.path.join(arena, &.{ dir, "model.safetensors.index.json" });
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20));
-    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return error.H3BadShardIndex;
+    // the image checkpoint names its shard index model.safetensors.index.json, the video one
+    // diffusion_pytorch_model.safetensors.index.json
+    var text: ?[]const u8 = null;
+    inline for (.{ "model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json" }) |index_name| {
+        const path = try std.fs.path.join(arena, &.{ dir, index_name });
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 << 20))) |t| {
+            text = t;
+            break;
+        } else |_| {}
+    }
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, text orelse return error.H3BadShardIndex, .{}) catch return error.H3BadShardIndex;
     if (doc != .object) return error.H3BadShardIndex;
     const map = doc.object.get("weight_map") orelse return error.H3BadShardIndex;
     if (map != .object) return error.H3BadShardIndex;
