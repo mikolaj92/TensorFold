@@ -264,7 +264,10 @@ pub fn checkRefiner(a: std.mem.Allocator, json: []const u8) !Refiner {
     if (doc != .object) return error.H3BadPromptConfig;
     const o = doc.object;
     var r = released_refiner;
-    try expect(o, "transformer", .{ .{ "text_dim", r.text }, .{ "hidden_size", r.hidden }, .{ "num_attention_heads", r.heads }, .{ "attention_head_dim", head_dim }, .{ "ffn_hidden_size", r.mlp }, .{ "token_refiner_num_layers", r.blocks } });
+    // the image checkpoint names the refiner's block count token_refiner_num_layers, the video one num_refiner_layers
+    try expect(o, "transformer", .{ .{ "text_dim", r.text }, .{ "hidden_size", r.hidden }, .{ "num_attention_heads", r.heads }, .{ "attention_head_dim", head_dim }, .{ "ffn_hidden_size", r.mlp } });
+    const layers_key = if (o.get("token_refiner_num_layers") != null) "token_refiner_num_layers" else "num_refiner_layers";
+    try expect(o, "transformer", .{.{ layers_key, r.blocks }});
     inline for (.{ .{ "eps", "norm_eps" }, .{ "qk_eps", "qk_norm_eps" }, .{ "final_eps", "final_norm_eps" } }) |kv| {
         const e = try number(o, kv[1]);
         if (!(e > 0 and e < 1)) return error.H3BadPromptConfig;
