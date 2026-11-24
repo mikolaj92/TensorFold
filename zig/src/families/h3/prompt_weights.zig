@@ -163,8 +163,12 @@ pub const Refiner = struct {
     cond_b: Ref,
     final_norm: Ref,
     blocks: []Block,
+    /// materialized qkv fusions owned by this Refiner (the video checkpoint's separate q/k/v)
+    fused: []mtl.Buffer = &.{},
 
     pub fn deinit(r: *Refiner, gpa: std.mem.Allocator) void {
+        for (r.fused) |*b| b.deinit();
+        if (r.fused.len > 0) gpa.free(r.fused);
         gpa.free(r.blocks);
         r.shards.deinit(gpa);
     }
@@ -172,7 +176,8 @@ pub const Refiner = struct {
 
 const FrontNames = struct {
     pub fn accepts(_: FrontNames, name: []const u8) bool {
-        return std.mem.startsWith(u8, name, "condition_proj.") or std.mem.startsWith(u8, name, "token_refiner.");
+        return std.mem.startsWith(u8, name, "condition_proj.") or std.mem.startsWith(u8, name, "token_refiner.") or
+            std.mem.startsWith(u8, name, "context_embedder.");
     }
 };
 
@@ -180,20 +185,82 @@ const FrontNames = struct {
 pub fn loadRefiner(gpa: std.mem.Allocator, io: std.Io, device: mtl.Device, dir: []const u8, g: rules.Refiner) !Refiner {
     var r: Refiner = .{ .g = g, .shards = try open(gpa, io, device, dir, FrontNames{}), .cond_w = undefined, .cond_b = undefined, .final_norm = undefined, .blocks = &.{} };
     errdefer r.shards.deinit(gpa);
-    inline for (.{ "cond_w", "cond_b", "final_norm" }, rules.frontTensors(g)) |field, s| {
-        std.debug.assert(std.mem.eql(u8, field, s[0]));
-        @field(r, field) = try r.shards.take(s[1], s[2]);
+    // the video checkpoint names the condition projection context_embedder and keeps separate q/k/v
+    var video = false;
+    for (r.shards.files) |*f| if (f.names.get("context_embedder.weight") != null) {
+        video = true;
+    };
+    var front: [3]struct { []const u8, []const u8, rules.Shape } = undefined;
+    if (video) {
+        front = .{
+            .{ "cond_w", "context_embedder.weight", .{ g.hidden, g.text } },
+            .{ "cond_b", "context_embedder.bias", .{ g.hidden, 0 } },
+            .{ "final_norm", "token_refiner.final_norm.weight", .{ g.hidden, 0 } },
+        };
+    } else {
+        front = rules.frontTensors(g);
+    }
+    inline for (.{ "cond_w", "cond_b", "final_norm" }, 0..) |field, fi| {
+        std.debug.assert(std.mem.eql(u8, @as([]const u8, field), front[fi][0]));
+        @field(r, field) = try r.shards.take(front[fi][1], front[fi][2]);
     }
     r.blocks = try gpa.alloc(Block, g.blocks);
     errdefer gpa.free(r.blocks);
     const specs = rules.blockTensors(g);
     var name: [96]u8 = undefined;
+    var fused: std.ArrayListUnmanaged(mtl.Buffer) = .empty;
+    errdefer {
+        for (fused.items) |*b| b.deinit();
+        fused.deinit(gpa);
+    }
     for (r.blocks, 0..) |*b, i| {
         inline for (comptime std.meta.fieldNames(Block), 0..) |field, f| {
             const s = specs[f];
-            std.debug.assert(std.mem.eql(u8, field, s[0]));
-            @field(b, field) = try r.shards.take(try std.fmt.bufPrint(&name, "token_refiner.blocks.{d}.{s}", .{ i, s[1] }), s[2]);
+            std.debug.assert(std.mem.eql(u8, @as([]const u8, field), s[0]));
+            if (comptime std.mem.eql(u8, @as([]const u8, field), "qkv")) {
+                if (video) {
+                    // fuse the video checkpoint's separate q, k and v into one [3*inner, h] tensor
+                    const h = g.hidden;
+                    const inner = g.heads * rules.head_dim;
+                    const rows = 3 * inner;
+                    const buf = try device.buffer(rows * h * 2, mtl.ResourceOptions.shared);
+                    const dst = buf.slice(u8, rows * h * 2);
+                    inline for (0..3) |part| {
+                        const part_name = switch (part) {
+                            0 => "attn.to_q.weight",
+                            1 => "attn.to_k.weight",
+                            else => "attn.to_v.weight",
+                        };
+                        const q = try r.shards.take(try std.fmt.bufPrint(&name, "token_refiner.refiner_blocks.{d}.{s}", .{ i, part_name }), s[2]);
+                        @memcpy(dst[part * inner * h * 2 ..][0 .. inner * h * 2], Shards.bytes(q, inner * h * 2));
+                    }
+                    try fused.append(gpa, buf);
+                    @field(b, field) = .{ .buffer = buf };
+                } else {
+                    @field(b, field) = try r.shards.take(try std.fmt.bufPrint(&name, "token_refiner.blocks.{d}.{s}", .{ i, s[1] }), s[2]);
+                }
+            } else if (video) {
+                // the video checkpoint's spelling of the same tensor
+                const video_name = videoBlockName(s[1]);
+                @field(b, field) = try r.shards.take(try std.fmt.bufPrint(&name, "token_refiner.refiner_blocks.{d}.{s}", .{ i, video_name }), s[2]);
+            } else {
+                @field(b, field) = try r.shards.take(try std.fmt.bufPrint(&name, "token_refiner.blocks.{d}.{s}", .{ i, s[1] }), s[2]);
+            }
         }
     }
+    r.fused = fused.items;
     return r;
+}
+
+/// The video checkpoint's spelling of an image checkpoint's refiner-block tensor name.
+fn videoBlockName(image_name: []const u8) []const u8 {
+    const pairs = .{
+        .{ "attn.q_norm.weight", "attn.norm_q.weight" },
+        .{ "attn.k_norm.weight", "attn.norm_k.weight" },
+        .{ "attn.out_proj.weight", "attn.to_out.0.weight" },
+        .{ "mlp.fc1.weight", "ff.net.0.proj.weight" },
+        .{ "mlp.fc2.weight", "ff.net.2.weight" },
+    };
+    inline for (pairs) |pair| if (std.mem.eql(u8, image_name, pair[0])) return pair[1];
+    return image_name;
 }
